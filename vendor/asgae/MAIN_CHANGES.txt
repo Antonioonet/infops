@@ -1,0 +1,79 @@
+Changes made since the original main.py
+=======================================
+
+1. Deleted main2.py and folded selected stability features into main.py.
+
+2. Added deterministic seeding:
+   - New set_seed(seed) helper.
+   - main.py now calls set_seed(args.random_seed).
+
+3. Replaced dense adjacency scoring:
+   - Removed get_real_adj() and dense N x N adjacency materialization.
+   - Added compute_structure_error_chunked() to compute structure error in chunks.
+   - Added --structure_chunk_size.
+
+4. Added defensive scoring utilities:
+   - tensor_to_device_long().
+   - build_continuous_predicted_value().
+   - Checks for unknown data_flag, NaN/Inf loss, empty residual graph, and one-class AUC labels.
+
+5. Added metric/result logging:
+   - main.py writes round, loss, AUC, and average precision to the configured result file.
+
+6. Added configurable output model path:
+   - New --model_path argument.
+   - This prevents parallel hyperparameter trials from overwriting the same model.pt.
+
+7. Added configurable supermodular/radius optimization steps:
+   - New --sp_epochs argument.
+   - Replaced the previous hard-coded 19-step loop with args.sp_epochs.
+
+8. Added early stopping:
+   - New --early_stopping_patience argument.
+   - New --early_stopping_min_delta argument.
+   - If patience is greater than zero, phase-1 training stops early when loss does not improve enough.
+
+9. Added hparam_search.py:
+   - Initial random/greedy hyperparameter search runner.
+   - Runs main.py as subprocesses across GPUs.
+   - Saves per-trial stdout, stderr, trial.json, trials.csv, and best.json.
+
+10. Added optuna_search.py:
+    - Optuna TPE search for AUC.
+    - MLflow logging for each trial.
+    - Uses data/real_world by default.
+    - Parallelizes trials across GPUs with CUDA_VISIBLE_DEVICES.
+    - Saves Optuna SQLite DB, MLflow runs, per-trial artifacts, best.json, and best_by_dataset.json.
+
+11. Optuna search space now includes:
+    - learning_rate.
+    - beta_1.
+    - beta_2.
+    - q.
+    - embedding_channels.
+    - hidden_channels.
+    - num_anchors.
+    - epochs.
+    - sp_epochs.
+    - ending_rounds, used as the outer iterator count.
+    - early_stopping_patience.
+
+12. Added explicit feature normalization in main.py:
+    - New normalize_node_features() helper.
+    - New is_row_normalized() helper.
+    - New --normalize_features / --no-normalize_features argument.
+    - data.x is now normalized before model construction and training, instead of only using a normalized copy for scoring.
+
+13. Made gradient clearing explicit:
+    - Removed hidden optimizer.zero_grad() dependency from train().
+    - The main training loop now calls optimizer.zero_grad(set_to_none=True) before each backward pass.
+    - The SP/radius phase already zeroed optimizer_sp before backward.
+
+14. Expanded Optuna beta sampling:
+    - beta_1 and beta_2 can now be sampled as continuous decimal floats.
+    - New --beta_sampling option with values float or categorical.
+    - New --beta_1_min, --beta_1_max, --beta_2_min, --beta_2_max, and --beta_log options.
+
+15. Updated run.sh:
+    - It now calls main.py instead of deleted main2.py.
+    - Removed arguments that only existed in main2.py.

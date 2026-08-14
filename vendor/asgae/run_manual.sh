@@ -1,0 +1,19 @@
+python main.py \
+  --data_flag real_world \
+  --data_dir data/real_world \
+  --real_world_name venezuela \
+  --num_anchors 100 \
+  --embedding_channels 32 \
+  --hidden_channels 32 \
+  --num_layers 2 \
+  --epochs 100 \
+  --sp_epochs 20 \
+  --learning_rate 5e-4 \
+  --sp_learning_rate 1e-4 \
+  --weight_decay 1e-4 \
+  --grad_clip 1. \
+  --beta_1 1.0 \
+  --beta_2 0.0001 \
+  --q 80 \
+  --structure_chunk_size 128 \
+  --ending_rounds 5

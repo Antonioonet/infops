@@ -1,2 +1,62 @@
-data/
-asgae/
+# macOS and editors
+.DS_Store
+**/.DS_Store
+.vscode/
+.idea/
+*~
+
+# Python caches and tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Python packaging
+build/
+dist/
+*.egg-info/
+
+# Virtual environments and secrets
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+**/.venv/
+**/venv/
+**/env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Project datasets
+/data/*
+!/data/README.md
+!/data/.gitkeep
+
+# Vendor content not intended for this repository
+/vendor/legacy/
+/vendor/asgae/data/
+/vendor/asgae/model/hparam_results*/
+
+# Generated experiment artifacts
+/artifacts/*
+!/artifacts/README.md
+!/artifacts/.gitkeep
+
+# Experiment tracking
+mlruns/
+mlflow.db
+wandb/
+optuna*.db
+*.sqlite3
+
+# Model checkpoints and logs
+*.pt
+*.pth
+*.ckpt
+*.log

@@ -1,0 +1,18 @@
+env/bin/python optuna_search.py \
+  --datasets china \
+  --data_dir data/real_world \
+  --gpus 0,1,2,3 \
+  --parallel_jobs 8 \
+  --n_trials 256 \
+  --target_auc 0.9 \
+  --output_dir optuna_results_china_v1\
+  --num_anchor_values 75,125,150,200,250 \
+  --embedding_channels_values 8,12,16,32,64,96,128 \
+  --hidden_channels_values 8,16,24,32 \
+  --num_layer_values 1,2,3,4,6,8 \
+  --epoch_values 50,100,150,200,250 \
+  --learning_rates 1e-2,5e-3,1e-3,5e-4,1e-4 \
+  --beta_1_values 0.5,0.75,1.25,1.5 \
+  --beta_2_values 1e0,1e-1,1e-2,1e-3,1e-4,1e-5 \
+  --q_values 85,88,92,95 \
+  --ending_round_values 1,2,3,4,5
