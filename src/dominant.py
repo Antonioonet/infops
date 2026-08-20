@@ -1,5 +1,7 @@
 import csv
+import gc
 import math
+import os
 import pickle
 import random
 import time
@@ -22,6 +24,21 @@ OUTPUT_ROOT = ROOT / "artifacts/results" / f"dominant_refactoring_{date.today().
 SEEDS = [1, 2, 3, 4, 5]
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 GPU = int(DEVICE.split(":")[1]) if DEVICE.startswith("cuda") else -1
+# `batch_size=0` and `num_neigh=-1` train on the whole graph and all
+# neighbours at once. That makes DOMINANT's adjacency reconstruction grow
+# quadratically with the graph size and easily exhausts GPU memory.
+BATCH_SIZE = int(os.environ.get("DOMINANT_BATCH_SIZE", "512"))
+NUM_NEIGHBORS = [
+    int(value)
+    for value in os.environ.get("DOMINANT_NUM_NEIGHBORS", "10,5,5,5").split(",")
+]
+
+if BATCH_SIZE <= 0:
+    raise ValueError("DOMINANT_BATCH_SIZE must be greater than zero")
+if len(NUM_NEIGHBORS) != 4 or any(value <= 0 for value in NUM_NEIGHBORS):
+    raise ValueError(
+        "DOMINANT_NUM_NEIGHBORS must contain four positive integers, e.g. 10,5,5,5"
+    )
 
 
 def set_seed(seed):
@@ -139,7 +156,10 @@ def main():
             log_file.write(message + "\n")
             log_file.flush()
 
-        log(f"Device: {DEVICE}")
+        log(
+            f"Device: {DEVICE}; batch_size={BATCH_SIZE}; "
+            f"num_neigh={NUM_NEIGHBORS}"
+        )
 
         for dataset in datasets:
             log(f"Starting {dataset}")
@@ -159,8 +179,8 @@ def main():
                     num_layers=4,
                     epoch=int(hp["epochs"]),
                     lr=float(hp["lr"]),
-                    batch_size=0,
-                    num_neigh=-1,
+                    batch_size=BATCH_SIZE,
+                    num_neigh=NUM_NEIGHBORS,
                     gpu=GPU,
                 )
 
@@ -238,8 +258,8 @@ def main():
                             "num_layers": 4,
                             "epoch": int(hp["epochs"]),
                             "lr": float(hp["lr"]),
-                            "batch_size": 0,
-                            "num_neigh": -1,
+                            "batch_size": BATCH_SIZE,
+                            "num_neigh": NUM_NEIGHBORS,
                         },
                         "feature_dim": int(data.x.shape[1]),
                         "thresholds_by_split": thresholds,
@@ -248,6 +268,14 @@ def main():
                         "score_max": score_max,
                         "validation_macro_f1_mean": seed_score,
                     }
+
+                # The checkpoint above contains CPU tensors only. Releasing
+                # the model between seeds prevents cached CUDA allocations
+                # from accumulating over a long benchmark run.
+                del model
+                if DEVICE.startswith("cuda"):
+                    torch.cuda.empty_cache()
+                gc.collect()
 
             checkpoint_dir = checkpoint_root / dataset
             checkpoint_dir.mkdir(exist_ok=True)
