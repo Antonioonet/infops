@@ -1,9 +1,22 @@
-torch
-torchvision
-torchaudio
+--extra-index-url https://download.pytorch.org/whl/cu128
+--find-links https://data.pyg.org/whl/torch-2.7.0+cu128.html
+
+# CUDA 12.8 wheels support NVIDIA Blackwell GPUs (sm_120), including RTX 5090.
+torch==2.7.0
+torchvision==0.22.0
+torchaudio==2.7.0
+torch-geometric==2.7.0
+pyg-lib
 torch-scatter
 torch-sparse
 torch-cluster
 torch-spline-conv
-torch-geometric
-pygod
+pygod==1.1.0
+
+
+
+
+
+
+
+
