@@ -1,0 +1,13 @@
+version: '3'
+services:
+  ubuntu-base:
+    image: ubuntu:26.04            
+    container_name: pygod
+    command: sleep infinity           
+    devices:
+      - nvidia.com/gpu=0            
+    volumes:
+      - .:/workspace                 
+    working_dir: /workspace           
+    ports:
+      - "8889:8889" 
