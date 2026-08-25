@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from sklearn.metrics import f1_score, roc_auc_score
 
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent
 DATA_ROOT = ROOT / "data"
 HP_FILE = ROOT / "artifacts/results/benchmark/all_models_best_auc_by_dataset.csv"
 SEEDS = [1, 2, 3, 4, 5]
