@@ -197,6 +197,12 @@ def parse_args():
     )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(
+        "--training-mode",
+        choices=("shared", "per-dataset"),
+        default="shared",
+        help="Train once on all graphs or train a fresh model on each target graph.",
+    )
+    parser.add_argument(
         "--pretrain-epochs",
         type=int,
         default=PRETRAIN_EPOCHS,
@@ -225,20 +231,35 @@ def main():
         f"device={DEVICE}; calibration_fraction={CALIBRATION_FRACTION}; "
         f"validation_fraction={VALIDATION_FRACTION}; "
         f"degree_feature_dim={DEGREE_FEATURE_DIM}; seed={args.seed}; "
-        f"pretrain_epochs={args.pretrain_epochs}"
+        f"pretrain_epochs={args.pretrain_epochs}; training_mode={args.training_mode}"
     )
     try:
         set_seed(args.seed)
-        start = time.perf_counter()
-        model = pretrain_model(
-            list(all_data.items()),
-            args.seed,
-            args.pretrain_epochs,
-        )
-        pretraining_seconds = time.perf_counter() - start
-        log(f"shared_pretraining_seconds={pretraining_seconds:.2f}")
+        shared_model = None
+        shared_training_seconds = None
+        if args.training_mode == "shared":
+            start = time.perf_counter()
+            shared_model = pretrain_model(
+                list(all_data.items()),
+                args.seed,
+                args.pretrain_epochs,
+            )
+            shared_training_seconds = time.perf_counter() - start
+            log(f"shared_training_seconds={shared_training_seconds:.2f}")
 
         for target_dataset in DATASETS:
+            if args.training_mode == "shared":
+                model = shared_model
+                training_seconds = shared_training_seconds
+            else:
+                set_seed(args.seed)
+                start = time.perf_counter()
+                model = pretrain_model(
+                    [(target_dataset, all_data[target_dataset])],
+                    args.seed,
+                    args.pretrain_epochs,
+                )
+                training_seconds = time.perf_counter() - start
             labels = all_data[target_dataset].y.numpy()
             start = time.perf_counter()
             scores = normalized_scores(model, all_data[target_dataset])
@@ -271,12 +292,19 @@ def main():
                 f"validation_auc={validation_auc:.4f} "
                 f"validation_precision={validation_precision:.4f} "
                 f"validation_recall={validation_recall:.4f} "
+                f"training_seconds={training_seconds:.2f} "
                 f"scoring_seconds={scoring_seconds:.2f}"
             )
-        del model
-        if DEVICE.startswith("cuda"):
-            torch.cuda.empty_cache()
-        gc.collect()
+            if args.training_mode == "per-dataset":
+                del model
+                if DEVICE.startswith("cuda"):
+                    torch.cuda.empty_cache()
+                gc.collect()
+        if shared_model is not None:
+            del shared_model
+            if DEVICE.startswith("cuda"):
+                torch.cuda.empty_cache()
+            gc.collect()
     finally:
         log_file.close()
 
