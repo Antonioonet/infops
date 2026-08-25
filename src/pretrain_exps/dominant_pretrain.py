@@ -9,7 +9,6 @@ from pathlib import Path
 
 import networkx as nx
 import numpy as np
-import pandas as pd
 import torch
 from pygod.detector import DOMINANT
 from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
@@ -20,12 +19,16 @@ from torch_geometric.loader import NeighborLoader
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 DATA_ROOT = ROOT / "data"
-HP_FILE = ROOT / "artifacts/results/benchmark/all_models_best_auc_by_dataset.csv"
 DATASETS = ("UAE", "china", "cuba", "iran", "russia", "venezuela")
-SEEDS = (1, 2, 3, 4, 5)
-CALIBRATION_FRACTION = 0.1
+CALIBRATION_FRACTION = 0.001
 VALIDATION_FRACTION = 0.499
 DEGREE_FEATURE_DIM = 15
+HID_DIM = 64
+NUM_LAYERS = 4
+LEARNING_RATE = 0.004
+BATCH_SIZE = 1024
+NUM_NEIGHBORS = 10
+PRETRAIN_EPOCHS = 100
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 GPU = int(DEVICE.split(":")[1]) if DEVICE.startswith("cuda") else -1
 
@@ -102,9 +105,13 @@ def best_training_threshold(scores, labels, calibration_mask):
 
 def target_split(labels, seed):
     indices = np.arange(len(labels))
+    calibration_size = max(
+        len(np.unique(labels)),
+        math.ceil(CALIBRATION_FRACTION * len(labels)),
+    )
     calibration, remaining = train_test_split(
         indices,
-        train_size=CALIBRATION_FRACTION,
+        train_size=calibration_size,
         random_state=seed,
         stratify=labels,
     )
@@ -124,14 +131,13 @@ def target_split(labels, seed):
     return calibration_mask, validation_mask, len(unused)
 
 
-def initialize_model(hp):
+def initialize_model():
     return DOMINANT(
-        hid_dim=int(hp["hid_dim"]),
-        num_layers=4,
-        epoch=int(hp["epochs"]),
-        lr=float(hp["lr"]),
-        batch_size=int(hp["batch_size"]),
-        num_neigh=int(hp["num_neigh"]),
+        hid_dim=HID_DIM,
+        num_layers=NUM_LAYERS,
+        lr=LEARNING_RATE,
+        batch_size=BATCH_SIZE,
+        num_neigh=NUM_NEIGHBORS,
         gpu=GPU,
         verbose=0,
     )
@@ -160,8 +166,8 @@ def pretrain_on_graph(model, optimizer, data, epochs):
             optimizer.step()
 
 
-def pretrain_model(source_data, hp, seed, pretrain_epochs):
-    model = initialize_model(hp)
+def pretrain_model(source_data, seed, pretrain_epochs):
+    model = initialize_model()
     optimizer = None
     for epoch_id in range(pretrain_epochs):
         source_order = list(source_data)
@@ -187,15 +193,14 @@ def normalized_scores(model, data):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Zero-shot leave-one-graph-out DOMINANT pretraining."
+        description="Single shared DOMINANT pretraining experiment."
     )
-    parser.add_argument("--datasets", nargs="+", choices=DATASETS, default=DATASETS)
-    parser.add_argument("--seeds", nargs="+", type=int, default=SEEDS)
+    parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(
         "--pretrain-epochs",
         type=int,
-        default=None,
-        help="Epochs over all five source graphs; default uses each target's prior best epoch count.",
+        default=PRETRAIN_EPOCHS,
+        help="Epochs over all six graphs during the one shared pretraining run.",
     )
     parser.add_argument(
         "--log-file",
@@ -208,8 +213,6 @@ def parse_args():
 def main():
     args = parse_args()
     args.log_file.parent.mkdir(parents=True, exist_ok=True)
-    hp_df = pd.read_csv(HP_FILE)
-    hp_df = hp_df[hp_df["model"] == "pygod_dominant"]
     all_data = {dataset: load_data(dataset) for dataset in DATASETS}
     log_file = args.log_file.open("w")
 
@@ -221,62 +224,59 @@ def main():
     log(
         f"device={DEVICE}; calibration_fraction={CALIBRATION_FRACTION}; "
         f"validation_fraction={VALIDATION_FRACTION}; "
-        f"degree_feature_dim={DEGREE_FEATURE_DIM}"
+        f"degree_feature_dim={DEGREE_FEATURE_DIM}; seed={args.seed}; "
+        f"pretrain_epochs={args.pretrain_epochs}"
     )
     try:
-        for target_dataset in args.datasets:
-            hp = hp_df[hp_df["dataset"] == target_dataset].iloc[0]
-            pretrain_epochs = args.pretrain_epochs or int(hp["epochs"])
-            source_data = [
-                (dataset, all_data[dataset])
-                for dataset in DATASETS
-                if dataset != target_dataset
-            ]
+        set_seed(args.seed)
+        start = time.perf_counter()
+        model = pretrain_model(
+            list(all_data.items()),
+            args.seed,
+            args.pretrain_epochs,
+        )
+        pretraining_seconds = time.perf_counter() - start
+        log(f"shared_pretraining_seconds={pretraining_seconds:.2f}")
+
+        for target_dataset in DATASETS:
             labels = all_data[target_dataset].y.numpy()
-            log(f"target={target_dataset}; sources={[name for name, _ in source_data]}")
-
-            for seed in args.seeds:
-                set_seed(seed)
-                start = time.perf_counter()
-                model = pretrain_model(source_data, hp, seed, pretrain_epochs)
-                pretraining_seconds = time.perf_counter() - start
-
-                start = time.perf_counter()
-                scores = normalized_scores(model, all_data[target_dataset])
-                scoring_seconds = time.perf_counter() - start
-                calibration_mask, validation_mask, unused_nodes = target_split(labels, seed)
-                threshold, calibration_macro_f1 = best_training_threshold(
-                    scores,
-                    labels,
-                    calibration_mask,
-                )
-                prediction = scores[validation_mask] > threshold
-                validation_macro_f1 = f1_score(
-                    labels[validation_mask], prediction, average="macro", zero_division=0
-                )
-                validation_auc = roc_auc_score(labels[validation_mask], scores[validation_mask])
-                validation_precision = precision_score(
-                    labels[validation_mask], prediction, zero_division=0
-                )
-                validation_recall = recall_score(
-                    labels[validation_mask], prediction, zero_division=0
-                )
-                log(
-                    f"target={target_dataset} seed={seed} "
-                    f"calibration_nodes={calibration_mask.sum()} "
-                    f"validation_nodes={validation_mask.sum()} unused_nodes={unused_nodes} "
-                    f"threshold={threshold:.6f} calibration_macro_f1={calibration_macro_f1:.4f} "
-                    f"validation_macro_f1={validation_macro_f1:.4f} "
-                    f"validation_auc={validation_auc:.4f} "
-                    f"validation_precision={validation_precision:.4f} "
-                    f"validation_recall={validation_recall:.4f} "
-                    f"pretraining_seconds={pretraining_seconds:.2f} "
-                    f"scoring_seconds={scoring_seconds:.2f}"
-                )
-                del model
-                if DEVICE.startswith("cuda"):
-                    torch.cuda.empty_cache()
-                gc.collect()
+            start = time.perf_counter()
+            scores = normalized_scores(model, all_data[target_dataset])
+            scoring_seconds = time.perf_counter() - start
+            calibration_mask, validation_mask, unused_nodes = target_split(
+                labels,
+                args.seed,
+            )
+            threshold, calibration_macro_f1 = best_training_threshold(
+                scores,
+                labels,
+                calibration_mask,
+            )
+            prediction = scores[validation_mask] > threshold
+            validation_macro_f1 = f1_score(
+                labels[validation_mask], prediction, average="macro", zero_division=0
+            )
+            validation_auc = roc_auc_score(labels[validation_mask], scores[validation_mask])
+            validation_precision = precision_score(
+                labels[validation_mask], prediction, zero_division=0
+            )
+            validation_recall = recall_score(
+                labels[validation_mask], prediction, zero_division=0
+            )
+            log(
+                f"target={target_dataset} calibration_nodes={calibration_mask.sum()} "
+                f"validation_nodes={validation_mask.sum()} unused_nodes={unused_nodes} "
+                f"threshold={threshold:.6f} calibration_macro_f1={calibration_macro_f1:.4f} "
+                f"validation_macro_f1={validation_macro_f1:.4f} "
+                f"validation_auc={validation_auc:.4f} "
+                f"validation_precision={validation_precision:.4f} "
+                f"validation_recall={validation_recall:.4f} "
+                f"scoring_seconds={scoring_seconds:.2f}"
+            )
+        del model
+        if DEVICE.startswith("cuda"):
+            torch.cuda.empty_cache()
+        gc.collect()
     finally:
         log_file.close()
 
