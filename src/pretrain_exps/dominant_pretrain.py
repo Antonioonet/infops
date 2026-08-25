@@ -1,11 +1,9 @@
 import argparse
-import csv
 import gc
 import math
 import pickle
 import random
 import time
-from datetime import date
 from pathlib import Path
 
 import networkx as nx
@@ -198,111 +196,75 @@ def parse_args():
         default=None,
         help="Epochs over all five source graphs; default uses each target's prior best epoch count.",
     )
-    parser.add_argument("--output-dir", type=Path, default=None)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    output_root = args.output_dir or (
-        ROOT / "artifacts/results" / f"dominant_pretrain_{date.today().isoformat()}"
-    )
-    output_root.mkdir(parents=True, exist_ok=True)
     hp_df = pd.read_csv(HP_FILE)
     hp_df = hp_df[hp_df["model"] == "pygod_dominant"]
     all_data = {dataset: load_data(dataset) for dataset in DATASETS}
-    columns = [
-        "target_dataset", "source_datasets", "seed", "hid_dim", "epochs",
-        "lr", "batch_size", "num_neigh", "pretrain_epochs",
-        "calibration_nodes", "validation_nodes", "unused_nodes", "threshold",
-        "calibration_macro_f1", "validation_macro_f1", "validation_auc",
-        "validation_precision", "validation_recall", "pretraining_seconds",
-        "scoring_seconds", "status",
-    ]
+    def log(message):
+        print(message, flush=True)
 
-    with open(output_root / "results.csv", "w", newline="") as csv_file, open(
-        output_root / "run.log", "w"
-    ) as log_file:
-        writer = csv.DictWriter(csv_file, fieldnames=columns)
-        writer.writeheader()
+    log(
+        f"device={DEVICE}; calibration_fraction={CALIBRATION_FRACTION}; "
+        f"validation_fraction={VALIDATION_FRACTION}; "
+        f"degree_feature_dim={DEGREE_FEATURE_DIM}"
+    )
+    for target_dataset in args.datasets:
+        hp = hp_df[hp_df["dataset"] == target_dataset].iloc[0]
+        pretrain_epochs = args.pretrain_epochs or int(hp["epochs"])
+        source_data = [
+            (dataset, all_data[dataset])
+            for dataset in DATASETS
+            if dataset != target_dataset
+        ]
+        labels = all_data[target_dataset].y.numpy()
+        log(f"target={target_dataset}; sources={[name for name, _ in source_data]}")
 
-        def log(message):
-            print(message, flush=True)
-            log_file.write(message + "\n")
-            log_file.flush()
+        for seed in args.seeds:
+            set_seed(seed)
+            start = time.perf_counter()
+            model = pretrain_model(source_data, hp, seed, pretrain_epochs)
+            pretraining_seconds = time.perf_counter() - start
 
-        log(
-            f"device={DEVICE}; calibration_fraction={CALIBRATION_FRACTION}; "
-            f"validation_fraction={VALIDATION_FRACTION}; "
-            f"degree_feature_dim={DEGREE_FEATURE_DIM}"
-        )
-        for target_dataset in args.datasets:
-            hp = hp_df[hp_df["dataset"] == target_dataset].iloc[0]
-            pretrain_epochs = args.pretrain_epochs or int(hp["epochs"])
-            source_data = [
-                (dataset, all_data[dataset])
-                for dataset in DATASETS
-                if dataset != target_dataset
-            ]
-            labels = all_data[target_dataset].y.numpy()
-            log(f"target={target_dataset}; sources={[name for name, _ in source_data]}")
-
-            for seed in args.seeds:
-                set_seed(seed)
-                start = time.perf_counter()
-                model = pretrain_model(source_data, hp, seed, pretrain_epochs)
-                pretraining_seconds = time.perf_counter() - start
-
-                start = time.perf_counter()
-                scores = normalized_scores(model, all_data[target_dataset])
-                scoring_seconds = time.perf_counter() - start
-                calibration_mask, validation_mask, unused_nodes = target_split(labels, seed)
-                threshold, calibration_macro_f1 = best_training_threshold(
-                    scores,
-                    labels,
-                    calibration_mask,
-                )
-                prediction = scores[validation_mask] > threshold
-                row = {
-                    "target_dataset": target_dataset,
-                    "source_datasets": ",".join(name for name, _ in source_data),
-                    "seed": seed,
-                    "hid_dim": int(hp["hid_dim"]),
-                    "epochs": int(hp["epochs"]),
-                    "lr": float(hp["lr"]),
-                    "batch_size": int(hp["batch_size"]),
-                    "num_neigh": int(hp["num_neigh"]),
-                    "pretrain_epochs": pretrain_epochs,
-                    "calibration_nodes": int(calibration_mask.sum()),
-                    "validation_nodes": int(validation_mask.sum()),
-                    "unused_nodes": unused_nodes,
-                    "threshold": threshold,
-                    "calibration_macro_f1": calibration_macro_f1,
-                    "validation_macro_f1": f1_score(
-                        labels[validation_mask], prediction, average="macro", zero_division=0
-                    ),
-                    "validation_auc": roc_auc_score(labels[validation_mask], scores[validation_mask]),
-                    "validation_precision": precision_score(
-                        labels[validation_mask], prediction, zero_division=0
-                    ),
-                    "validation_recall": recall_score(
-                        labels[validation_mask], prediction, zero_division=0
-                    ),
-                    "pretraining_seconds": pretraining_seconds,
-                    "scoring_seconds": scoring_seconds,
-                    "status": "ok",
-                }
-                writer.writerow(row)
-                csv_file.flush()
-                log(
-                    f"target={target_dataset} seed={seed} "
-                    f"validation_macro_f1={row['validation_macro_f1']:.4f} "
-                    f"validation_auc={row['validation_auc']:.4f}"
-                )
-                del model
-                if DEVICE.startswith("cuda"):
-                    torch.cuda.empty_cache()
-                gc.collect()
+            start = time.perf_counter()
+            scores = normalized_scores(model, all_data[target_dataset])
+            scoring_seconds = time.perf_counter() - start
+            calibration_mask, validation_mask, unused_nodes = target_split(labels, seed)
+            threshold, calibration_macro_f1 = best_training_threshold(
+                scores,
+                labels,
+                calibration_mask,
+            )
+            prediction = scores[validation_mask] > threshold
+            validation_macro_f1 = f1_score(
+                labels[validation_mask], prediction, average="macro", zero_division=0
+            )
+            validation_auc = roc_auc_score(labels[validation_mask], scores[validation_mask])
+            validation_precision = precision_score(
+                labels[validation_mask], prediction, zero_division=0
+            )
+            validation_recall = recall_score(
+                labels[validation_mask], prediction, zero_division=0
+            )
+            log(
+                f"target={target_dataset} seed={seed} "
+                f"calibration_nodes={calibration_mask.sum()} "
+                f"validation_nodes={validation_mask.sum()} unused_nodes={unused_nodes} "
+                f"threshold={threshold:.6f} calibration_macro_f1={calibration_macro_f1:.4f} "
+                f"validation_macro_f1={validation_macro_f1:.4f} "
+                f"validation_auc={validation_auc:.4f} "
+                f"validation_precision={validation_precision:.4f} "
+                f"validation_recall={validation_recall:.4f} "
+                f"pretraining_seconds={pretraining_seconds:.2f} "
+                f"scoring_seconds={scoring_seconds:.2f}"
+            )
+            del model
+            if DEVICE.startswith("cuda"):
+                torch.cuda.empty_cache()
+            gc.collect()
 
 
 if __name__ == "__main__":
