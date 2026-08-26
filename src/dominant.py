@@ -1,43 +1,42 @@
-import csv
+import argparse
 import gc
 import math
 import os
 import pickle
 import random
 import time
-from datetime import date
 from pathlib import Path
 
 import networkx as nx
 import numpy as np
 import pandas as pd
 import torch
-from pygod.detector import CoLA
+from pygod.detector import DOMINANT
 from sklearn.metrics import f1_score, roc_auc_score
 from torch_geometric.data import Data
 
+from experiment_utils import train_validation_test_masks
 
-ROOT = Path(__file__).resolve().parent.parent.parent
+
+ROOT = Path(__file__).resolve().parent.parent
 DATA_ROOT = ROOT / "data"
 HP_FILE = ROOT / "artifacts/results/benchmark/all_models_best_auc_by_dataset.csv"
-OUTPUT_ROOT = ROOT / "artifacts/results" / f"cola_refactoring_{date.today().isoformat()}"
-SEEDS = [1, 2, 3, 4, 5]
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 GPU = int(DEVICE.split(":")[1]) if DEVICE.startswith("cuda") else -1
 # `batch_size=0` and `num_neigh=-1` train on the whole graph and all
-# neighbours at once. That makes CoLA's adjacency reconstruction grow
+# neighbours at once. That makes DOMINANT's adjacency reconstruction grow
 # quadratically with the graph size and easily exhausts GPU memory.
-BATCH_SIZE = int(os.environ.get("CoLA_BATCH_SIZE", "512"))
+BATCH_SIZE = int(os.environ.get("DOMINANT_BATCH_SIZE", "512"))
 NUM_NEIGHBORS = [
     int(value)
-    for value in os.environ.get("CoLA_NUM_NEIGHBORS", "10,5,5,5").split(",")
+    for value in os.environ.get("DOMINANT_NUM_NEIGHBORS", "10,5,5,5").split(",")
 ]
 
 if BATCH_SIZE <= 0:
-    raise ValueError("CoLA_BATCH_SIZE must be greater than zero")
+    raise ValueError("DOMINANT_BATCH_SIZE must be greater than zero")
 if len(NUM_NEIGHBORS) != 4 or any(value <= 0 for value in NUM_NEIGHBORS):
     raise ValueError(
-        "CoLA_NUM_NEIGHBORS must contain four positive integers, e.g. 10,5,5,5"
+        "DOMINANT_NUM_NEIGHBORS must contain four positive integers, e.g. 10,5,5,5"
     )
 
 
@@ -123,58 +122,37 @@ def best_training_threshold(scores, labels, train_mask):
     return best_threshold, best_macro_f1
 
 
-def main():
-    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-    checkpoint_root = OUTPUT_ROOT / "checkpoints"
-    checkpoint_root.mkdir(exist_ok=True)
+def parse_args():
+    parser = argparse.ArgumentParser(description="DOMINANT node anomaly experiment")
+    parser.add_argument("--datasets", nargs="+", default=None)
+    parser.add_argument("--seeds", nargs="+", type=int, default=[1, 2, 3, 4, 5])
+    parser.add_argument("--train-fraction", type=float, default=0.6)
+    parser.add_argument("--validation-fraction", type=float, default=0.2)
+    parser.add_argument("--test-fraction", type=float, default=0.2)
+    parser.add_argument("--save-first-model", action="store_true")
+    parser.add_argument("--log-file", type=Path, default=ROOT / "artifacts/logs/dominant.log")
+    return parser.parse_args()
 
+
+def main(args):
+    args.log_file.parent.mkdir(parents=True, exist_ok=True)
     hp_df = pd.read_csv(HP_FILE)
-    hp_df = hp_df[hp_df["model"] == "pygod_cola"]
-
-    datasets = sorted(path.name for path in DATA_ROOT.iterdir() if path.is_dir())
-
-    columns = [
-        "dataset",
-        "seed",
-        "split",
-        "threshold",
-        "train_macro_f1",
-        "validation_macro_f1",
-        "validation_auc",
-        "training_seconds",
-        "status",
-    ]
-
-    with open(OUTPUT_ROOT / "results.csv", "w", newline="") as csv_file, open(
-        OUTPUT_ROOT / "run.log", "w"
-    ) as log_file:
-        writer = csv.DictWriter(csv_file, fieldnames=columns)
-        writer.writeheader()
-
+    hp_df = hp_df[hp_df["model"] == "pygod_dominant"]
+    datasets = args.datasets or sorted(path.name for path in DATA_ROOT.iterdir() if path.is_dir())
+    with args.log_file.open("w") as log_file:
         def log(message):
-            print(message)
+            print(message, flush=True)
             log_file.write(message + "\n")
             log_file.flush()
 
-        log(
-            f"Device: {DEVICE}; batch_size={BATCH_SIZE}; "
-            f"num_neigh={NUM_NEIGHBORS}"
-        )
-
+        log(f"device={DEVICE}; train={args.train_fraction}; validation={args.validation_fraction}; test={args.test_fraction}")
         for dataset in datasets:
-            log(f"Starting {dataset}")
-
-            graph_data, data = load_data(dataset)
+            _, data = load_data(dataset)
             labels = data.y.numpy()
             hp = hp_df[hp_df["dataset"] == dataset].iloc[0]
-
-            best_seed_score = -1
-            best_checkpoint = None
-
-            for seed in SEEDS:
+            for seed in args.seeds:
                 set_seed(seed)
-
-                model = CoLA(
+                model = DOMINANT(
                     hid_dim=int(hp["hid_dim"]),
                     num_layers=4,
                     epoch=int(hp["epochs"]),
@@ -192,63 +170,28 @@ def main():
                 score_min = float(raw_scores.min())
                 score_max = float(raw_scores.max())
                 scores = (raw_scores - score_min) / (score_max - score_min + 1e-12)
-
-                validation_scores = []
-                thresholds = []
-
-                for split_id in range(5):
-                    split = graph_data["splits"][split_id]
-                    train_mask = np.asarray(split["train"], dtype=bool)
-                    val_mask = np.asarray(split["val"], dtype=bool)
-
-                    threshold, train_macro_f1 = best_training_threshold(
-                        scores,
-                        labels,
-                        train_mask,
-                    )
-
-                    val_prediction = scores[val_mask] > threshold
-                    validation_macro_f1 = f1_score(
-                        labels[val_mask],
-                        val_prediction,
-                        average="macro",
-                        zero_division=0,
-                    )
-                    validation_auc = roc_auc_score(
-                        labels[val_mask],
-                        scores[val_mask],
-                    )
-
-                    writer.writerow({
+                train_mask, validation_mask, test_mask = train_validation_test_masks(
+                    labels, args.train_fraction, args.validation_fraction, args.test_fraction, seed
+                )
+                threshold, train_macro_f1 = best_training_threshold(scores, labels, train_mask)
+                validation_prediction = scores[validation_mask] > threshold
+                test_prediction = scores[test_mask] > threshold
+                log(
+                    f"dataset={dataset} seed={seed} train_nodes={train_mask.sum()} "
+                    f"validation_nodes={validation_mask.sum()} test_nodes={test_mask.sum()} "
+                    f"threshold={threshold:.6f} train_macro_f1={train_macro_f1:.4f} "
+                    f"validation_macro_f1={f1_score(labels[validation_mask], validation_prediction, average='macro', zero_division=0):.4f} "
+                    f"validation_auc={roc_auc_score(labels[validation_mask], scores[validation_mask]):.4f} "
+                    f"test_macro_f1={f1_score(labels[test_mask], test_prediction, average='macro', zero_division=0):.4f} "
+                    f"test_auc={roc_auc_score(labels[test_mask], scores[test_mask]):.4f} "
+                    f"training_seconds={training_seconds:.2f}"
+                )
+                if args.save_first_model and seed == args.seeds[0]:
+                    model_path = ROOT / "artifacts/checkpoints/dominant" / dataset / "dominant.pt"
+                    model_path.parent.mkdir(parents=True, exist_ok=True)
+                    torch.save({
                         "dataset": dataset,
                         "seed": seed,
-                        "split": split_id,
-                        "threshold": threshold,
-                        "train_macro_f1": train_macro_f1,
-                        "validation_macro_f1": validation_macro_f1,
-                        "validation_auc": validation_auc,
-                        "training_seconds": training_seconds,
-                        "status": "ok",
-                    })
-                    csv_file.flush()
-
-                    validation_scores.append(validation_macro_f1)
-                    thresholds.append(threshold)
-
-                    log(
-                        f"{dataset} seed={seed} split={split_id} "
-                        f"threshold={threshold:.4f} "
-                        f"validation_macro_f1={validation_macro_f1:.4f}"
-                    )
-
-                seed_score = float(np.mean(validation_scores))
-
-                if seed_score > best_seed_score:
-                    best_seed_score = seed_score
-                    best_checkpoint = {
-                        "dataset": dataset,
-                        "seed": seed,
-                        "device": DEVICE,
                         "state_dict": {
                             name: value.detach().cpu()
                             for name, value in model.model.state_dict().items()
@@ -262,32 +205,12 @@ def main():
                             "num_neigh": NUM_NEIGHBORS,
                         },
                         "feature_dim": int(data.x.shape[1]),
-                        "thresholds_by_split": thresholds,
-                        "default_threshold": float(np.median(thresholds)),
-                        "score_min": score_min,
-                        "score_max": score_max,
-                        "validation_macro_f1_mean": seed_score,
-                    }
-
-                # The checkpoint above contains CPU tensors only. Releasing
-                # the model between seeds prevents cached CUDA allocations
-                # from accumulating over a long benchmark run.
+                        "threshold": threshold,
+                    }, model_path)
                 del model
                 if DEVICE.startswith("cuda"):
                     torch.cuda.empty_cache()
                 gc.collect()
 
-            checkpoint_dir = checkpoint_root / dataset
-            checkpoint_dir.mkdir(exist_ok=True)
-            torch.save(best_checkpoint, checkpoint_dir / "cola.pt")
-
-            log(
-                f"Completed {dataset}; best_seed={best_checkpoint['seed']} "
-                f"validation_macro_f1_mean={best_seed_score:.4f}"
-            )
-
-
 if __name__ == "__main__":
-    print(ROOT)
-    
-    main()
+    main(parse_args())

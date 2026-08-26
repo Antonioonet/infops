@@ -1,6 +1,7 @@
 import csv
 import gc
 import math
+import os
 import pickle
 import random
 import time
@@ -11,34 +12,33 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 import torch
-from pygod.detector import GADNR
+from pygod.detector import CoLA
 from sklearn.metrics import f1_score, roc_auc_score
 from torch_geometric.data import Data
-from torch_geometric.nn import GCN, GIN, GraphSAGE
 
 
-ROOT = Path(__file__).resolve().parent.parent.parent
+ROOT = Path(__file__).resolve().parent.parent
 DATA_ROOT = ROOT / "data"
 HP_FILE = ROOT / "artifacts/results/benchmark/all_models_best_auc_by_dataset.csv"
-OUTPUT_ROOT = ROOT / "artifacts/results" / f"gadnr_refactoring_{date.today().isoformat()}"
+OUTPUT_ROOT = ROOT / "artifacts/results" / f"cola_refactoring_{date.today().isoformat()}"
 SEEDS = [1, 2, 3, 4, 5]
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 GPU = int(DEVICE.split(":")[1]) if DEVICE.startswith("cuda") else -1
+# `batch_size=0` and `num_neigh=-1` train on the whole graph and all
+# neighbours at once. That makes CoLA's adjacency reconstruction grow
+# quadratically with the graph size and easily exhausts GPU memory.
+BATCH_SIZE = int(os.environ.get("CoLA_BATCH_SIZE", "512"))
+NUM_NEIGHBORS = [
+    int(value)
+    for value in os.environ.get("CoLA_NUM_NEIGHBORS", "10,5,5,5").split(",")
+]
 
-
-def pyg_backbone(backbone):
-    def build_backbone(**kwargs):
-        kwargs.pop("tot_nodes", None)
-        return backbone(**kwargs)
-
-    return build_backbone
-
-
-BACKBONES = {
-    "GCN": pyg_backbone(GCN),
-    "GraphSAGE": pyg_backbone(GraphSAGE),
-    "GIN": pyg_backbone(GIN),
-}
+if BATCH_SIZE <= 0:
+    raise ValueError("CoLA_BATCH_SIZE must be greater than zero")
+if len(NUM_NEIGHBORS) != 4 or any(value <= 0 for value in NUM_NEIGHBORS):
+    raise ValueError(
+        "CoLA_NUM_NEIGHBORS must contain four positive integers, e.g. 10,5,5,5"
+    )
 
 
 def set_seed(seed):
@@ -129,7 +129,7 @@ def main():
     checkpoint_root.mkdir(exist_ok=True)
 
     hp_df = pd.read_csv(HP_FILE)
-    hp_df = hp_df[hp_df["model"] == "gadnr"]
+    hp_df = hp_df[hp_df["model"] == "pygod_cola"]
 
     datasets = sorted(path.name for path in DATA_ROOT.iterdir() if path.is_dir())
 
@@ -156,7 +156,10 @@ def main():
             log_file.write(message + "\n")
             log_file.flush()
 
-        log(f"Device: {DEVICE}")
+        log(
+            f"Device: {DEVICE}; batch_size={BATCH_SIZE}; "
+            f"num_neigh={NUM_NEIGHBORS}"
+        )
 
         for dataset in datasets:
             log(f"Starting {dataset}")
@@ -164,8 +167,6 @@ def main():
             graph_data, data = load_data(dataset)
             labels = data.y.numpy()
             hp = hp_df[hp_df["dataset"] == dataset].iloc[0]
-            if DEVICE.startswith("cuda"):
-                data = data.to(DEVICE)
 
             best_seed_score = -1
             best_checkpoint = None
@@ -173,42 +174,21 @@ def main():
             for seed in SEEDS:
                 set_seed(seed)
 
-                model = GADNR(
+                model = CoLA(
                     hid_dim=int(hp["hid_dim"]),
-                    num_layers=1,
-                    deg_dec_layers=4,
-                    fea_dec_layers=3,
-                    backbone=BACKBONES[hp["backbone"]],
-                    sample_size=2,
-                    sample_time=3,
-                    neigh_loss="KL",
-                    lambda_loss1=float(hp["lambda_n"]),
-                    lambda_loss2=float(hp["lambda_x"]),
-                    lambda_loss3=float(hp["lambda_d"]),
-                    real_loss=False,
+                    num_layers=4,
                     epoch=int(hp["epochs"]),
-                    lr=0.01,
-                    dropout=0.0,
-                    weight_decay=0.0003,
-                    batch_size=int(hp["batch_size"]),
-                    num_neigh=int(hp["num_neigh"]),
+                    lr=float(hp["lr"]),
+                    batch_size=BATCH_SIZE,
+                    num_neigh=NUM_NEIGHBORS,
                     gpu=GPU,
                 )
 
                 start = time.perf_counter()
-                model.fit(
-                    data,
-                    label=data.y,
-                    h_loss_weight=float(hp["lambda_n_prime"]),
-                    degree_loss_weight=float(hp["lambda_d_prime"]),
-                    feature_loss_weight=float(hp["lambda_x_prime"]),
-                )
+                model.fit(data)
                 training_seconds = time.perf_counter() - start
 
-                raw_scores = model.decision_score_
-                if torch.is_tensor(raw_scores):
-                    raw_scores = raw_scores.detach().cpu().numpy()
-                raw_scores = np.asarray(raw_scores)
+                raw_scores = model.decision_score_.detach().cpu().numpy()
                 score_min = float(raw_scores.min())
                 score_max = float(raw_scores.max())
                 scores = (raw_scores - score_min) / (score_max - score_min + 1e-12)
@@ -275,26 +255,11 @@ def main():
                         },
                         "hyperparameters": {
                             "hid_dim": int(hp["hid_dim"]),
-                            "num_layers": 1,
-                            "deg_dec_layers": 4,
-                            "fea_dec_layers": 3,
-                            "backbone": hp["backbone"],
-                            "sample_size": 2,
-                            "sample_time": 3,
-                            "neigh_loss": "KL",
-                            "lambda_n": float(hp["lambda_n"]),
-                            "lambda_x": float(hp["lambda_x"]),
-                            "lambda_d": float(hp["lambda_d"]),
-                            "lambda_n_prime": float(hp["lambda_n_prime"]),
-                            "lambda_x_prime": float(hp["lambda_x_prime"]),
-                            "lambda_d_prime": float(hp["lambda_d_prime"]),
-                            "real_loss": False,
+                            "num_layers": 4,
                             "epoch": int(hp["epochs"]),
-                            "lr": 0.01,
-                            "dropout": 0.0,
-                            "weight_decay": 0.0003,
-                            "batch_size": int(hp["batch_size"]),
-                            "num_neigh": int(hp["num_neigh"]),
+                            "lr": float(hp["lr"]),
+                            "batch_size": BATCH_SIZE,
+                            "num_neigh": NUM_NEIGHBORS,
                         },
                         "feature_dim": int(data.x.shape[1]),
                         "thresholds_by_split": thresholds,
@@ -314,7 +279,7 @@ def main():
 
             checkpoint_dir = checkpoint_root / dataset
             checkpoint_dir.mkdir(exist_ok=True)
-            torch.save(best_checkpoint, checkpoint_dir / "gadnr.pt")
+            torch.save(best_checkpoint, checkpoint_dir / "cola.pt")
 
             log(
                 f"Completed {dataset}; best_seed={best_checkpoint['seed']} "
