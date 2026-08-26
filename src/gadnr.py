@@ -1,3 +1,4 @@
+import argparse
 import csv
 import gc
 import math
@@ -15,6 +16,8 @@ from pygod.detector import GADNR
 from sklearn.metrics import f1_score, roc_auc_score
 from torch_geometric.data import Data
 from torch_geometric.nn import GCN, GIN, GraphSAGE
+
+from experiment_utils import train_validation_test_masks
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -123,7 +126,9 @@ def best_training_threshold(scores, labels, train_mask):
     return best_threshold, best_macro_f1
 
 
-def main():
+def main(args=None):
+    if args is None:
+        args = parse_args()
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     checkpoint_root = OUTPUT_ROOT / "checkpoints"
     checkpoint_root.mkdir(exist_ok=True)
@@ -141,6 +146,8 @@ def main():
         "train_macro_f1",
         "validation_macro_f1",
         "validation_auc",
+        "test_macro_f1",
+        "test_auc",
         "training_seconds",
         "status",
     ]
@@ -216,10 +223,11 @@ def main():
                 validation_scores = []
                 thresholds = []
 
-                for split_id in range(5):
-                    split = graph_data["splits"][split_id]
-                    train_mask = np.asarray(split["train"], dtype=bool)
-                    val_mask = np.asarray(split["val"], dtype=bool)
+                for split_id in range(1):
+                    train_mask, val_mask, test_mask = train_validation_test_masks(
+                        labels, args.train_fraction, args.validation_fraction,
+                        args.test_fraction, seed,
+                    )
 
                     threshold, train_macro_f1 = best_training_threshold(
                         scores,
@@ -238,6 +246,9 @@ def main():
                         labels[val_mask],
                         scores[val_mask],
                     )
+                    test_prediction = scores[test_mask] > threshold
+                    test_macro_f1 = f1_score(labels[test_mask], test_prediction, average="macro", zero_division=0)
+                    test_auc = roc_auc_score(labels[test_mask], scores[test_mask])
 
                     writer.writerow({
                         "dataset": dataset,
@@ -247,6 +258,8 @@ def main():
                         "train_macro_f1": train_macro_f1,
                         "validation_macro_f1": validation_macro_f1,
                         "validation_auc": validation_auc,
+                        "test_macro_f1": test_macro_f1,
+                        "test_auc": test_auc,
                         "training_seconds": training_seconds,
                         "status": "ok",
                     })
@@ -314,7 +327,8 @@ def main():
 
             checkpoint_dir = checkpoint_root / dataset
             checkpoint_dir.mkdir(exist_ok=True)
-            torch.save(best_checkpoint, checkpoint_dir / "gadnr.pt")
+            if args.save_first_model:
+                torch.save(best_checkpoint, checkpoint_dir / "gadnr.pt")
 
             log(
                 f"Completed {dataset}; best_seed={best_checkpoint['seed']} "
@@ -322,7 +336,14 @@ def main():
             )
 
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train-fraction", type=float, default=0.6)
+    parser.add_argument("--validation-fraction", type=float, default=0.2)
+    parser.add_argument("--test-fraction", type=float, default=0.2)
+    parser.add_argument("--save-first-model", action="store_true")
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    print(ROOT)
-    
     main()
