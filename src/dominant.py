@@ -1,4 +1,5 @@
 import argparse
+import csv
 import gc
 import math
 import os
@@ -131,15 +132,20 @@ def parse_args():
     parser.add_argument("--test-fraction", type=float, default=0.2)
     parser.add_argument("--save-first-model", action="store_true")
     parser.add_argument("--log-file", type=Path, default=ROOT / "artifacts/logs/dominant.log")
+    parser.add_argument("--output-csv", type=Path, default=ROOT / "artifacts/results/dominant.csv")
     return parser.parse_args()
 
 
 def main(args):
     args.log_file.parent.mkdir(parents=True, exist_ok=True)
+    args.output_csv.parent.mkdir(parents=True, exist_ok=True)
     hp_df = pd.read_csv(HP_FILE)
     hp_df = hp_df[hp_df["model"] == "pygod_dominant"]
     datasets = args.datasets or sorted(path.name for path in DATA_ROOT.iterdir() if path.is_dir())
-    with args.log_file.open("w") as log_file:
+    fields = ["dataset", "seed", "train_nodes", "validation_nodes", "test_nodes", "threshold", "train_macro_f1", "validation_macro_f1", "validation_auc", "test_macro_f1", "test_auc", "training_seconds"]
+    with args.log_file.open("w") as log_file, args.output_csv.open("w", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fields)
+        writer.writeheader()
         def log(message):
             print(message, flush=True)
             log_file.write(message + "\n")
@@ -176,14 +182,28 @@ def main(args):
                 threshold, train_macro_f1 = best_training_threshold(scores, labels, train_mask)
                 validation_prediction = scores[validation_mask] > threshold
                 test_prediction = scores[test_mask] > threshold
+                row = {
+                    "dataset": dataset, "seed": seed,
+                    "train_nodes": int(train_mask.sum()),
+                    "validation_nodes": int(validation_mask.sum()),
+                    "test_nodes": int(test_mask.sum()), "threshold": threshold,
+                    "train_macro_f1": train_macro_f1,
+                    "validation_macro_f1": f1_score(labels[validation_mask], validation_prediction, average="macro", zero_division=0),
+                    "validation_auc": roc_auc_score(labels[validation_mask], scores[validation_mask]),
+                    "test_macro_f1": f1_score(labels[test_mask], test_prediction, average="macro", zero_division=0),
+                    "test_auc": roc_auc_score(labels[test_mask], scores[test_mask]),
+                    "training_seconds": training_seconds,
+                }
+                writer.writerow(row)
+                csv_file.flush()
                 log(
                     f"dataset={dataset} seed={seed} train_nodes={train_mask.sum()} "
                     f"validation_nodes={validation_mask.sum()} test_nodes={test_mask.sum()} "
                     f"threshold={threshold:.6f} train_macro_f1={train_macro_f1:.4f} "
-                    f"validation_macro_f1={f1_score(labels[validation_mask], validation_prediction, average='macro', zero_division=0):.4f} "
-                    f"validation_auc={roc_auc_score(labels[validation_mask], scores[validation_mask]):.4f} "
-                    f"test_macro_f1={f1_score(labels[test_mask], test_prediction, average='macro', zero_division=0):.4f} "
-                    f"test_auc={roc_auc_score(labels[test_mask], scores[test_mask]):.4f} "
+                    f"validation_macro_f1={row['validation_macro_f1']:.4f} "
+                    f"validation_auc={row['validation_auc']:.4f} "
+                    f"test_macro_f1={row['test_macro_f1']:.4f} "
+                    f"test_auc={row['test_auc']:.4f} "
                     f"training_seconds={training_seconds:.2f}"
                 )
                 if args.save_first_model and seed == args.seeds[0]:
